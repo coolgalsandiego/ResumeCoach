@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # OpenAI (for development/fallback)
     OPENAI_API_KEY: Optional[str] = None
     USE_OPENAI_FALLBACK: bool = True
+    
+    # Ollama (local LLM - free, no API key needed)
+    OLLAMA_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "mistral"  # Options: mistral (fast), llama2, codellama, etc.
 
     # Redis (caching)
     REDIS_HOST: str = "localhost"
@@ -63,6 +67,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = True
+        extra = "ignore"  # Allow extra fields in .env file
 
     @property
     def cors_origins_list(self) -> List[str]:

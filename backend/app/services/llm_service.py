@@ -1,22 +1,52 @@
 """
-LLM service for interacting with language models (SageMaker or OpenAI)
+LLM service for interacting with language models (OpenAI, Ollama, or SageMaker)
 """
 import boto3
 import json
+import httpx
+import time
 from typing import Dict, Optional, List
 from app.config import settings
-import openai
+from openai import OpenAI
+from app.logger import get_logger
+
+logger = get_logger("llm_service")
 
 
 class LLMService:
-    """Service for LLM inference"""
+    """Service for LLM inference with fallback support"""
 
     def __init__(self):
         self.sagemaker_client = None
         self.endpoint_name = settings.SAGEMAKER_ENDPOINT_NAME
-        self.use_openai = settings.USE_OPENAI_FALLBACK
+        self.openai_client = None
+        self.ollama_available = False
+        self.ollama_model = getattr(settings, 'OLLAMA_MODEL', 'llama2')
+        self.ollama_url = getattr(settings, 'OLLAMA_URL', 'http://localhost:11434')
+        
+        # Determine which LLM provider to use
+        self.provider = self._determine_provider()
+        print(f"LLM Service initialized with provider: {self.provider}")
 
-        # Initialize SageMaker client if credentials available
+    def _determine_provider(self) -> str:
+        """Determine which LLM provider to use based on availability"""
+        
+        # 1. Try OpenAI first if API key is provided and looks valid
+        if settings.OPENAI_API_KEY and settings.OPENAI_API_KEY.startswith('sk-'):
+            try:
+                self.openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+                # Quick validation - just create the client, don't make a call yet
+                logger.info("OpenAI API key found and configured")
+                return "openai"
+            except Exception as e:
+                logger.warning(f"OpenAI initialization failed: {e}")
+        
+        # 2. Try Ollama (local LLM)
+        if self._check_ollama():
+            logger.info(f"Ollama is available with model: {self.ollama_model}")
+            return "ollama"
+        
+        # 3. Try SageMaker
         try:
             self.sagemaker_client = boto3.client(
                 'sagemaker-runtime',
@@ -24,13 +54,45 @@ class LLMService:
                 aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
                 aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY
             )
+            logger.info("SageMaker client initialized")
+            return "sagemaker"
         except Exception as e:
-            print(f"Warning: Could not initialize SageMaker client: {e}")
-            self.use_openai = True
-
-        # Set OpenAI API key
-        if settings.OPENAI_API_KEY:
-            openai.api_key = settings.OPENAI_API_KEY
+            logger.warning(f"SageMaker initialization failed: {e}")
+        
+        # 4. Fallback - will error when called
+        logger.error("No LLM provider available!")
+        return "none"
+    
+    def _check_ollama(self) -> bool:
+        """Check if Ollama is running locally"""
+        try:
+            response = httpx.get(f"{self.ollama_url}/api/tags", timeout=2.0)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                if not models:
+                    logger.warning("Ollama is running but no models are installed")
+                    return False
+                
+                # Get full model names (including :tag)
+                model_names = [m.get('name', '') for m in models]
+                logger.debug(f"Available Ollama models: {model_names}")
+                
+                # Check if requested model exists
+                for name in model_names:
+                    if self.ollama_model in name or name.split(':')[0] == self.ollama_model:
+                        self.ollama_model = name  # Use full name with tag
+                        self.ollama_available = True
+                        logger.info(f"Using Ollama model: {self.ollama_model}")
+                        return True
+                
+                # Use first available model as fallback
+                self.ollama_model = model_names[0]
+                self.ollama_available = True
+                logger.info(f"Requested model not found, using: {self.ollama_model}")
+                return True
+        except Exception as e:
+            logger.debug(f"Ollama not available: {e}")
+        return False
 
     async def generate(
         self,
@@ -41,7 +103,7 @@ class LLMService:
         system_prompt: Optional[str] = None
     ) -> str:
         """
-        Generate text using LLM
+        Generate text using LLM with automatic fallback
 
         Args:
             prompt: The input prompt
@@ -56,14 +118,123 @@ class LLMService:
         temperature = temperature if temperature is not None else settings.DEFAULT_TEMPERATURE
         max_tokens = max_tokens if max_tokens is not None else settings.DEFAULT_MAX_TOKENS
 
-        if self.use_openai or not self.sagemaker_client:
-            return await self._generate_openai(prompt, temperature, max_tokens, stop_sequences, system_prompt)
-        else:
+        # Try providers in order with fallback
+        providers = self._get_provider_order()
+        last_error = None
+        
+        logger.debug(f"Starting LLM generation with provider order: {providers}")
+        logger.debug(f"Prompt length: {len(prompt)} chars, temp: {temperature}, max_tokens: {max_tokens}")
+        
+        for provider in providers:
             try:
-                return await self._generate_sagemaker(prompt, temperature, max_tokens, stop_sequences)
+                start_time = time.time()
+                logger.info(f"Attempting generation with {provider}...")
+                
+                if provider == "openai":
+                    result = await self._generate_openai(prompt, temperature, max_tokens, stop_sequences, system_prompt)
+                elif provider == "ollama":
+                    result = await self._generate_ollama(prompt, temperature, max_tokens, stop_sequences, system_prompt)
+                elif provider == "sagemaker":
+                    result = await self._generate_sagemaker(prompt, temperature, max_tokens, stop_sequences)
+                else:
+                    continue
+                
+                elapsed = time.time() - start_time
+                logger.info(f"✓ {provider} succeeded in {elapsed:.2f}s, response length: {len(result)} chars")
+                return result
+                
             except Exception as e:
-                print(f"SageMaker inference failed: {e}, falling back to OpenAI")
-                return await self._generate_openai(prompt, temperature, max_tokens, stop_sequences, system_prompt)
+                elapsed = time.time() - start_time
+                logger.warning(f"✗ {provider} failed after {elapsed:.2f}s: {e}")
+                last_error = e
+                continue
+        
+        logger.error(f"All LLM providers failed. Last error: {last_error}")
+        raise Exception(f"All LLM providers failed. Last error: {last_error}")
+    
+    def _get_provider_order(self) -> List[str]:
+        """Get ordered list of providers to try"""
+        if self.provider == "openai":
+            return ["openai", "ollama", "sagemaker"]
+        elif self.provider == "ollama":
+            return ["ollama", "openai", "sagemaker"]
+        elif self.provider == "sagemaker":
+            return ["sagemaker", "openai", "ollama"]
+        return ["ollama", "openai", "sagemaker"]
+    
+    async def _generate_ollama(
+        self,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+        stop_sequences: Optional[List[str]],
+        system_prompt: Optional[str] = None
+    ) -> str:
+        """Generate using Ollama (local LLM)"""
+        if not self.ollama_available:
+            raise Exception("Ollama is not available")
+        
+        messages = []
+        
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        else:
+            messages.append({"role": "system", "content": "You are an expert career coach."})
+        
+        messages.append({"role": "user", "content": prompt})
+        
+        payload = {
+            "model": self.ollama_model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens
+            }
+        }
+        
+        if stop_sequences:
+            payload["options"]["stop"] = stop_sequences
+        
+        logger.debug(f"Calling Ollama model: {self.ollama_model}")
+        logger.debug(f"Ollama payload: model={self.ollama_model}, messages={len(messages)}, temp={temperature}")
+        
+        try:
+            # 5 minute timeout for complex prompts with local models
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                response = await client.post(
+                    f"{self.ollama_url}/api/chat",
+                    json=payload
+                )
+                
+                if response.status_code != 200:
+                    error_text = response.text
+                    logger.error(f"Ollama returned {response.status_code}: {error_text}")
+                    raise Exception(f"Ollama returned {response.status_code}: {error_text}")
+                
+                result = response.json()
+                content = result.get("message", {}).get("content", "")
+                
+                if not content:
+                    logger.error(f"Ollama returned empty response: {result}")
+                    raise Exception(f"Ollama returned empty response: {result}")
+                
+                # Log token usage if available
+                eval_count = result.get("eval_count", "N/A")
+                total_duration = result.get("total_duration", 0) / 1e9  # Convert to seconds
+                logger.debug(f"Ollama response: {len(content)} chars, {eval_count} tokens, {total_duration:.2f}s")
+                
+                return content
+                
+        except httpx.TimeoutException:
+            logger.error("Ollama request timed out (300s)")
+            raise Exception("Ollama request timed out (300s). The model may be loading or the prompt is too long.")
+        except httpx.ConnectError:
+            logger.error(f"Cannot connect to Ollama at {self.ollama_url}")
+            raise Exception(f"Cannot connect to Ollama at {self.ollama_url}. Is it running?")
+        except Exception as e:
+            logger.error(f"Ollama API failed: {str(e)}")
+            raise Exception(f"Ollama API failed: {str(e)}")
 
     async def _generate_sagemaker(
         self,
@@ -122,6 +293,9 @@ class LLMService:
     ) -> str:
         """Generate using OpenAI API (fallback/development)"""
         try:
+            if not self.openai_client:
+                raise Exception("OpenAI client not initialized. Please set OPENAI_API_KEY.")
+
             messages = []
 
             if system_prompt:
@@ -131,7 +305,7 @@ class LLMService:
 
             messages.append({"role": "user", "content": prompt})
 
-            response = openai.ChatCompletion.create(
+            response = self.openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=messages,
                 temperature=temperature,

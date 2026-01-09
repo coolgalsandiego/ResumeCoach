@@ -2,10 +2,14 @@
 Analysis service for resume-job matching analysis
 """
 import re
+import time
 from typing import Dict, List, Optional
 from app.services.llm_service import LLMService
 from app.services.data_processor import DataProcessor
 from app.chains.prompts import get_prompt
+from app.logger import get_logger
+
+logger = get_logger("analysis_service")
 
 
 class AnalysisService:
@@ -32,42 +36,63 @@ class AnalysisService:
         Returns:
             Dictionary with complete analysis
         """
+        total_start_time = time.time()
+        logger.info("=" * 50)
+        logger.info("Starting resume analysis")
+        logger.info(f"Resume length: {len(resume_text)} chars, Job description length: {len(job_description)} chars")
+        
         # Handle long documents
         resume_processed = self._handle_long_text(resume_text, max_tokens=1500)
         job_processed = self._handle_long_text(job_description, max_tokens=1500)
+        logger.debug(f"Processed resume: {len(resume_processed)} chars, job: {len(job_processed)} chars")
 
         # Extract model parameters
         temperature = model_params.get('temperature', 0.5) if model_params else 0.5
         max_tokens = model_params.get('max_tokens', 800) if model_params else 800
+        logger.debug(f"Model params: temperature={temperature}, max_tokens={max_tokens}")
 
         # Run analyses in sequence
-        print("Running fit analysis...")
+        logger.info("[1/4] Running fit analysis...")
+        step_start = time.time()
         fit_analysis = await self._run_fit_analysis(
             resume_processed, job_processed, temperature, max_tokens
         )
+        logger.info(f"[1/4] Fit analysis completed in {time.time() - step_start:.2f}s")
 
-        print("Running gap analysis...")
+        logger.info("[2/4] Running gap analysis...")
+        step_start = time.time()
         gap_analysis = await self._run_gap_analysis(
             resume_processed, job_processed, temperature, max_tokens
         )
+        logger.info(f"[2/4] Gap analysis completed in {time.time() - step_start:.2f}s")
 
-        print("Running strengths analysis...")
+        logger.info("[3/4] Running strengths analysis...")
+        step_start = time.time()
         strengths_analysis = await self._run_strengths_analysis(
             resume_processed, job_processed, temperature, max_tokens
         )
+        logger.info(f"[3/4] Strengths analysis completed in {time.time() - step_start:.2f}s")
 
         # Extract key information
         overall_fit, match_score = self._extract_fit_score(fit_analysis)
         gaps_summary = self._summarize_gaps(gap_analysis)
         strengths_summary = self._summarize_strengths(strengths_analysis)
+        logger.debug(f"Extracted: fit={overall_fit}, score={match_score}")
 
         # Generate coaching advice
-        print("Generating coaching advice...")
+        logger.info("[4/4] Generating coaching advice...")
+        step_start = time.time()
         coaching_advice = await self._generate_coaching_advice(
             overall_fit, match_score, gaps_summary, strengths_summary,
             temperature, max_tokens
         )
+        logger.info(f"[4/4] Coaching advice completed in {time.time() - step_start:.2f}s")
 
+        total_time = time.time() - total_start_time
+        logger.info(f"Analysis completed successfully in {total_time:.2f}s")
+        logger.info(f"Result: {overall_fit} fit, {match_score}% match score")
+        logger.info("=" * 50)
+        
         return {
             'fit_analysis': fit_analysis,
             'gap_analysis': gap_analysis,
